@@ -24,7 +24,6 @@ struct InstanceStats {
           currentRunDuration(0) {}
 };
 
-// player queue
 int g_tanks = 0;
 int g_heals = 0;
 int g_dps   = 0;
@@ -39,7 +38,8 @@ std::condition_variable g_cvPlayers;
 std::mutex g_coutMutex;              
 std::atomic<bool> g_recruiting(false);   
 std::atomic<bool> g_doneAll(false);     
-std::atomic<int> g_bonusGenerations(10);
+std::atomic<int> g_generatorDurationSeconds(0);
+
 
 int readPositiveInt(const std::string &prompt) {
     int value;
@@ -120,7 +120,7 @@ void dungeonWorker(InstanceStats *stats, unsigned int seed) {
                           << ", Heals: " << g_heals
                           << ", DPS: " << g_dps << '\n';
             }
-        } // release g_queueMutex
+        } 
 
         {
             std::lock_guard<std::mutex> outLock(g_coutMutex);
@@ -145,15 +145,40 @@ void dungeonWorker(InstanceStats *stats, unsigned int seed) {
     }
 }
 
-// Bonus random player generator
 void playerGenerator() {
-    std::mt19937 rng(std::random_device{}());
-    std::uniform_int_distribution<int> sleepDist(1, 3);   // seconds between arrivals
-    std::uniform_int_distribution<int> roleDist(1, 3);    
+    using namespace std::chrono;
 
-    int generations = g_bonusGenerations.load();
-    for (int i = 0; i < generations; ++i) {
+    std::mt19937 rng(std::random_device{}());
+    std::uniform_int_distribution<int> sleepDist(1, 3); 
+    std::uniform_int_distribution<int> roleDist(1, 3); 
+
+    while (true) {
+        {
+            std::lock_guard<std::mutex> lock(g_queueMutex);
+            if (!canFormPartyLocked()) {
+                break; 
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+
+    int duration = g_generatorDurationSeconds.load();
+    auto start = steady_clock::now();
+
+    while (true) {
+        auto now = steady_clock::now();
+        auto elapsed = duration_cast<seconds>(now - start).count();
+        if (elapsed >= duration) {
+            break; 
+        }
+
         std::this_thread::sleep_for(std::chrono::seconds(sleepDist(rng)));
+
+        now = steady_clock::now();
+        elapsed = duration_cast<seconds>(now - start).count();
+        if (elapsed >= duration) {
+            break;
+        }
 
         int addT = 0, addH = 0, addD = 0;
         int choice = roleDist(rng);
@@ -174,8 +199,8 @@ void playerGenerator() {
             {
                 std::lock_guard<std::mutex> outLock(g_coutMutex);
                 std::cout << "[Generator] Added -> +" << addT << "T, +" << addH
-                        << "H, +" << addD << "D. Now in queue: T=" << g_tanks
-                        << ", H=" << g_heals << ", D=" << g_dps << '\n';
+                          << "H, +" << addD << "D. Now in queue: T=" << g_tanks
+                          << ", H=" << g_heals << ", D=" << g_dps << '\n';
             }
         }
 
@@ -188,6 +213,7 @@ void playerGenerator() {
     }
     g_cvPlayers.notify_all();
 }
+
 
 void statusMonitor(const std::vector<InstanceStats*> &instances) {
     using namespace std::chrono_literals;
@@ -273,8 +299,8 @@ int main() {
     g_recruiting.store(useBonus);
 
     if (useBonus) {
-        int userGenerations = readPositiveInt("How many additional random players to add? ");
-        g_bonusGenerations.store(userGenerations);
+        int runSeconds = readPositiveInt("How long should the random player generator run for (in seconds)? ");
+        g_generatorDurationSeconds.store(runSeconds);
     }
 
     std::vector<InstanceStats*> instances;
@@ -290,7 +316,6 @@ int main() {
         workers.emplace_back(dungeonWorker, instances[i], seed);
     }
 
-    // Start random player generator
     std::thread generatorThread;
     if (useBonus) {
         generatorThread = std::thread(playerGenerator);
